@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -371,10 +372,36 @@ func executePrintFile(root string, workers int, filter func(*cacheEntry) bool, m
 		if err != nil {
 			return fmt.Errorf("open %s: %w", res.Entry.Path, err)
 		}
-		if _, err := io.Copy(os.Stdout, file); err != nil {
+
+		bodyStart := res.Entry.Metadata.BodyStart
+		if bodyStart <= 0 {
 			file.Close()
-			return fmt.Errorf("copy %s: %w", res.Entry.Path, err)
+			return fmt.Errorf("cache file missing body offset %s", res.Entry.Path)
 		}
+		if int64(bodyStart) >= res.Entry.Size {
+			file.Close()
+			return fmt.Errorf("body offset %d beyond file size for %s", bodyStart, res.Entry.Path)
+		}
+		if _, err := file.Seek(int64(bodyStart), io.SeekStart); err != nil {
+			file.Close()
+			return fmt.Errorf("seek %s: %w", res.Entry.Path, err)
+		}
+
+		if res.Entry.Metadata.ContentLength > 0 {
+			if _, err := io.CopyN(os.Stdout, file, res.Entry.Metadata.ContentLength); err != nil {
+				file.Close()
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					return fmt.Errorf("cached body truncated for %s: %w", res.Entry.Path, err)
+				}
+				return fmt.Errorf("copy %s: %w", res.Entry.Path, err)
+			}
+		} else {
+			if _, err := io.Copy(os.Stdout, file); err != nil {
+				file.Close()
+				return fmt.Errorf("copy %s: %w", res.Entry.Path, err)
+			}
+		}
+
 		if err := file.Close(); err != nil {
 			return fmt.Errorf("close %s: %w", res.Entry.Path, err)
 		}
