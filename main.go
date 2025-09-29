@@ -29,6 +29,7 @@ func main() {
 	dryRun := fs.Bool("dry-run", false, "When purging, show what would be removed without deleting")
 	matchAll := fs.Bool("all", false, "Match every cache entry (dangerous)")
 	printFile := fs.Bool("print-file", false, "Write raw bytes of the first matched cache file to stdout")
+	summary := fs.Bool("summary", false, "Print aggregate statistics for matched entries")
 
 	var contains stringSliceFlag
 	fs.Var(&contains, "contains", "Substring to match against cache key, path, or content-type (repeatable)")
@@ -63,6 +64,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--print-file cannot be combined with --json")
 		os.Exit(1)
 	}
+	if *summary && *purge {
+		fmt.Fprintln(os.Stderr, "--summary cannot be combined with --purge")
+		os.Exit(1)
+	}
+	if *summary && *printFile {
+		fmt.Fprintln(os.Stderr, "--summary cannot be combined with --print-file")
+		os.Exit(1)
+	}
+	if *summary && *jsonOut {
+		fmt.Fprintln(os.Stderr, "--summary cannot be combined with --json")
+		os.Exit(1)
+	}
 
 	filter, err := buildEntryFilter(contains, statusFilters)
 	if err != nil {
@@ -84,6 +97,14 @@ func main() {
 		return
 	}
 
+	if *summary {
+		if err := executeSummary(ctx, root, *workers, filter, *matchAll); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *printFile {
 		if err := executePrintFile(root, *workers, filter, *matchAll); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -92,7 +113,7 @@ func main() {
 		return
 	}
 
-	if err := executeList(ctx, root, *workers, filter, *jsonOut); err != nil {
+	if err := executeList(ctx, root, *workers, filter, *jsonOut, *matchAll); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -109,7 +130,7 @@ func (s *stringSliceFlag) Set(value string) error {
 	return nil
 }
 
-func executeList(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, jsonOut bool) error {
+func executeList(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, jsonOut bool, matchAll bool) error {
 	results := scanCache(ctx, root, workers)
 
 	var entries []*cacheEntry
@@ -126,7 +147,7 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 		if res.Entry == nil {
 			continue
 		}
-		if !filter(res.Entry) {
+		if !matchAll && !filter(res.Entry) {
 			continue
 		}
 		entries = append(entries, res.Entry)
@@ -146,6 +167,122 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 	} else {
 		writePrettyList(entries, root)
 	}
+
+	return encounteredErr
+}
+
+func executeSummary(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, matchAll bool) error {
+	results := scanCache(ctx, root, workers)
+
+	var encounteredErr error
+	var totalFiles int64
+	var totalSize int64
+	minSize := int64(-1)
+	var maxSize int64
+	contentCounts := make(map[string]int)
+	statusCounts := make(map[int]int)
+	ageCounts := map[string]int{
+		"<1h":   0,
+		"<1d":   0,
+		"<7d":   0,
+		"<30d":  0,
+		">=30d": 0,
+	}
+	now := time.Now()
+
+	for res := range results {
+		if res.Err != nil {
+			fmt.Fprintf(os.Stderr, "scan error: %v\n", res.Err)
+			if encounteredErr == nil {
+				encounteredErr = res.Err
+			}
+			continue
+		}
+		if res.Entry == nil {
+			continue
+		}
+		if !matchAll && !filter(res.Entry) {
+			continue
+		}
+
+		totalFiles++
+		size := res.Entry.Size
+		totalSize += size
+		if minSize == -1 || size < minSize {
+			minSize = size
+		}
+		if size > maxSize {
+			maxSize = size
+		}
+
+		ct := res.Entry.Metadata.Headers["content-type"]
+		if ct == "" {
+			ct = "(unknown)"
+		} else {
+			ct = strings.ToLower(ct)
+		}
+		contentCounts[ct]++
+
+		statusCounts[res.Entry.Metadata.StatusCode]++
+
+		age := now.Sub(res.Entry.ModTime)
+		switch {
+		case age < time.Hour:
+			ageCounts["<1h"]++
+		case age < 24*time.Hour:
+			ageCounts["<1d"]++
+		case age < 7*24*time.Hour:
+			ageCounts["<7d"]++
+		case age < 30*24*time.Hour:
+			ageCounts["<30d"]++
+		default:
+			ageCounts[">=30d"]++
+		}
+	}
+
+	if totalFiles == 0 {
+		fmt.Println("No matching cache entries found.")
+		return encounteredErr
+	}
+
+	avgSize := float64(totalSize) / float64(totalFiles)
+
+	fmt.Printf("Summary for %s\n", root)
+	fmt.Printf("Total files: %d\n", totalFiles)
+	fmt.Printf("Total size: %s (%d bytes)\n", formatBytes(float64(totalSize)), totalSize)
+	fmt.Printf("Average size: %s\n", formatBytes(avgSize))
+	fmt.Printf("Min size: %s (%d bytes)\n", formatBytes(float64(minSize)), minSize)
+	fmt.Printf("Max size: %s (%d bytes)\n", formatBytes(float64(maxSize)), maxSize)
+	fmt.Println()
+
+	fmt.Println("Content Types:")
+	contentKeys := make([]string, 0, len(contentCounts))
+	for k := range contentCounts {
+		contentKeys = append(contentKeys, k)
+	}
+	sort.Strings(contentKeys)
+	for _, k := range contentKeys {
+		fmt.Printf("  %s: %d\n", k, contentCounts[k])
+	}
+
+	fmt.Println()
+	fmt.Println("Status Codes:")
+	statusKeys := make([]int, 0, len(statusCounts))
+	for k := range statusCounts {
+		statusKeys = append(statusKeys, k)
+	}
+	sort.Ints(statusKeys)
+	for _, k := range statusKeys {
+		fmt.Printf("  %d: %d\n", k, statusCounts[k])
+	}
+
+	fmt.Println()
+	fmt.Println("Age Distribution:")
+	fmt.Printf("  <1h: %d\n", ageCounts["<1h"])
+	fmt.Printf("  <1d: %d\n", ageCounts["<1d"])
+	fmt.Printf("  <7d: %d\n", ageCounts["<7d"])
+	fmt.Printf("  <30d: %d\n", ageCounts["<30d"])
+	fmt.Printf("  >=30d: %d\n", ageCounts[">=30d"])
 
 	return encounteredErr
 }
@@ -299,9 +436,9 @@ func writePrettyList(entries []*cacheEntry, root string) {
 		fmt.Printf("  Status: %s\n", e.Metadata.StatusLine)
 		fmt.Printf("  Path: %s\n", rel)
 		fmt.Printf("  Stored: %s\n", e.ModTime.Format(time.RFC3339))
-		fmt.Printf("  Size: %d bytes", e.Size)
+		fmt.Printf("  Size: %s (%d bytes)", formatBytes(float64(e.Size)), e.Size)
 		if e.Metadata.ContentLength > 0 {
-			fmt.Printf(" (Content-Length: %d)", e.Metadata.ContentLength)
+			fmt.Printf(" (Content-Length: %s (%d))", formatBytes(float64(e.Metadata.ContentLength)), e.Metadata.ContentLength)
 		}
 		if ct, ok := e.Metadata.Headers["content-type"]; ok {
 			fmt.Printf("\n  Content-Type: %s", ct)
@@ -365,4 +502,20 @@ func buildEntryFilter(contains, statuses []string) (func(*cacheEntry) bool, erro
 
 		return true
 	}, nil
+}
+
+func formatBytes(v float64) string {
+	if v < 0 {
+		return "-" + formatBytes(-v)
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%.0f %s", v, units[i])
+	}
+	return fmt.Sprintf("%.2f %s", v, units[i])
 }
