@@ -1,4 +1,5 @@
 .gocache/
 proxy-cache-example/
+itchio-pagecache/
 nginx/
 nginxcachetool

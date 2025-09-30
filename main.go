@@ -20,6 +20,15 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+const (
+	colorReset  = "\x1b[0m"
+	colorGreen  = "\x1b[32m"
+	colorYellow = "\x1b[33m"
+	colorRed    = "\x1b[31m"
+)
+
+var errSkipCacheFile = errors.New("skip cache file")
+
 func main() {
 	fs := flag.NewFlagSet("nginxcachetool", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -280,10 +289,10 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 
 	fmt.Printf("Summary for %s\n", root)
 	fmt.Printf("Total files: %d\n", totalFiles)
-	fmt.Printf("Total size: %s (%d bytes)\n", formatBytes(float64(totalSize)), totalSize)
+	fmt.Printf("Total size: %s\n", formatBytes(float64(totalSize)))
 	fmt.Printf("Average size: %s\n", formatBytes(avgSize))
-	fmt.Printf("Min size: %s (%d bytes)\n", formatBytes(float64(minSize)), minSize)
-	fmt.Printf("Max size: %s (%d bytes)\n", formatBytes(float64(maxSize)), maxSize)
+	fmt.Printf("Min size: %s\n", formatBytes(float64(minSize)))
+	fmt.Printf("Max size: %s\n", formatBytes(float64(maxSize)))
 	fmt.Println()
 
 	fmt.Println("Content Types:")
@@ -423,7 +432,7 @@ func executeWatch(root string) error {
 			}
 
 			action := classifyCacheEvent(event.Op, event.Name)
-			if action == "" {
+			if action == nil {
 				continue
 			}
 
@@ -431,7 +440,7 @@ func executeWatch(root string) error {
 			if r, err := filepath.Rel(root, event.Name); err == nil {
 				rel = r
 			}
-			fmt.Printf("[%s] %s\n", action, rel)
+			printWatchLine(action, rel, event.Name)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -447,21 +456,69 @@ func executeWatch(root string) error {
 	}
 }
 
-func classifyCacheEvent(op fsnotify.Op, name string) string {
+type watchAction struct {
+	label        string
+	color        string
+	showMetadata bool
+}
+
+func printWatchLine(action *watchAction, relPath, fullPath string) {
+	line := fmt.Sprintf("%s[%s]%s %s", action.color, action.label, colorReset, relPath)
+
+	if action.showMetadata {
+		entry, err := fetchCacheEntry(fullPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "watch metadata %s: %v\n", fullPath, err)
+		} else {
+			ct := entry.Metadata.Headers["content-type"]
+			if ct == "" {
+				ct = "(unknown)"
+			}
+			status := entry.Metadata.StatusCode
+
+			var bodyBytes int64
+			if entry.Metadata.ContentLength > 0 {
+				bodyBytes = entry.Metadata.ContentLength
+			} else {
+				bodyBytes = entry.Size - int64(entry.Metadata.BodyStart)
+				if bodyBytes < 0 {
+					bodyBytes = entry.Size
+				}
+			}
+
+			sizeLabel := formatBytes(float64(bodyBytes))
+			line += fmt.Sprintf(" size=%s status=%d content-type=%s", sizeLabel, status, ct)
+		}
+	}
+
+	fmt.Println(line)
+}
+
+func fetchCacheEntry(path string) (*cacheEntry, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	job := fileJob{path: path, size: info.Size(), modTime: info.ModTime()}
+	return parseCacheFile(job)
+}
+
+func classifyCacheEvent(op fsnotify.Op, name string) *watchAction {
 	if isTempCacheFile(name) {
-		return ""
+		return nil
 	}
 	switch {
 	case op&fsnotify.Create != 0:
-		return "added"
+		return &watchAction{label: "added", color: colorGreen, showMetadata: true}
 	case op&fsnotify.Remove != 0:
-		return "removed"
+		return &watchAction{label: "removed", color: colorRed}
 	case op&fsnotify.Rename != 0:
-		return "removed"
+		return &watchAction{label: "removed", color: colorRed}
 	case op&fsnotify.Write != 0:
-		return "updated"
+		return &watchAction{label: "updated", color: colorYellow}
 	default:
-		return ""
+		return nil
 	}
 }
 
@@ -607,9 +664,9 @@ func writePrettyList(entries []*cacheEntry, root string) {
 		fmt.Printf("  Status: %s\n", e.Metadata.StatusLine)
 		fmt.Printf("  Path: %s\n", rel)
 		fmt.Printf("  Stored: %s\n", e.ModTime.Format(time.RFC3339))
-		fmt.Printf("  Size: %s (%d bytes)", formatBytes(float64(e.Size)), e.Size)
+		fmt.Printf("  Size: %s", formatBytes(float64(e.Size)))
 		if e.Metadata.ContentLength > 0 {
-			fmt.Printf(" (Content-Length: %s (%d))", formatBytes(float64(e.Metadata.ContentLength)), e.Metadata.ContentLength)
+			fmt.Printf(" (Content-Length: %s)", formatBytes(float64(e.Metadata.ContentLength)))
 		}
 		if ct, ok := e.Metadata.Headers["content-type"]; ok {
 			fmt.Printf("\n  Content-Type: %s", ct)

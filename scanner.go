@@ -92,6 +92,9 @@ func scanCache(ctx context.Context, root string, workers int) <-chan cacheResult
 						}
 						entry, err := parseCacheFile(job)
 						if err != nil {
+							if errors.Is(err, errSkipCacheFile) {
+								continue
+							}
 							select {
 							case <-ctx.Done():
 								return
@@ -163,6 +166,10 @@ func scanCache(ctx context.Context, root string, workers int) <-chan cacheResult
 }
 
 func parseCacheFile(job fileJob) (*cacheEntry, error) {
+	if isTempCacheFile(job.path) {
+		return nil, errSkipCacheFile
+	}
+
 	f, err := os.Open(job.path)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", job.path, err)
@@ -171,11 +178,14 @@ func parseCacheFile(job fileJob) (*cacheEntry, error) {
 
 	header := make([]byte, metadataHeaderPrefix)
 	if _, err := io.ReadFull(f, header); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, errSkipCacheFile
+		}
 		return nil, fmt.Errorf("read header %s: %w", job.path, err)
 	}
 
 	if len(header) < bodyStartOffset+4 {
-		return nil, fmt.Errorf("header too short in %s", job.path)
+		return nil, errSkipCacheFile
 	}
 
 	version := header[0]
@@ -193,6 +203,9 @@ func parseCacheFile(job fileJob) (*cacheEntry, error) {
 	metadataBuf := make([]byte, bodyStart)
 	section := io.NewSectionReader(f, 0, int64(bodyStart))
 	if _, err := io.ReadFull(section, metadataBuf); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, errSkipCacheFile
+		}
 		return nil, fmt.Errorf("read metadata %s: %w", job.path, err)
 	}
 
