@@ -389,10 +389,12 @@ func executeWatch(root string, withMetadata bool, workers int) error {
 
 	var store *watchMetadataStore
 	if withMetadata {
+		fmt.Printf("Preloading cache metadata from %s...\n", root)
 		store = newWatchMetadataStore()
 		if err := store.Load(context.Background(), root, workers); err != nil {
 			fmt.Fprintf(os.Stderr, "initial metadata load: %v\n", err)
 		}
+		fmt.Printf("Loaded metadata for %d cache entries.\n", store.Count())
 	}
 
 	addDir := func(path string) error {
@@ -497,7 +499,9 @@ func printWatchLine(action *watchAction, relPath, fullPath string, existing *cac
 		var err error
 		entry, err = fetchCacheEntry(fullPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "watch metadata %s: %v\n", fullPath, err)
+			if !(action.label == "removed" && errors.Is(err, os.ErrNotExist)) {
+				fmt.Fprintf(os.Stderr, "watch metadata %s: %v\n", fullPath, err)
+			}
 		}
 	}
 
@@ -519,7 +523,17 @@ func printWatchLine(action *watchAction, relPath, fullPath string, existing *cac
 		}
 
 		sizeLabel := formatBytes(float64(bodyBytes))
-		line += fmt.Sprintf(" size=%s status=%d content-type=%s", sizeLabel, status, ct)
+		details := []string{
+			fmt.Sprintf("size=%s", sizeLabel),
+			fmt.Sprintf("status=%d", status),
+			fmt.Sprintf("content-type=%s", ct),
+		}
+
+		if entry.Metadata.Key != "" {
+			details = append(details, fmt.Sprintf("key=%s", entry.Metadata.Key))
+		}
+
+		line += " " + strings.Join(details, " ")
 	}
 
 	fmt.Println(line)
@@ -543,9 +557,9 @@ func classifyCacheEvent(op fsnotify.Op, name string) *watchAction {
 	case op&fsnotify.Create != 0:
 		return &watchAction{label: "added", color: colorGreen, showMetadata: true}
 	case op&fsnotify.Remove != 0:
-		return &watchAction{label: "removed", color: colorRed}
+		return &watchAction{label: "removed", color: colorRed, showMetadata: true}
 	case op&fsnotify.Rename != 0:
-		return &watchAction{label: "removed", color: colorRed}
+		return &watchAction{label: "removed", color: colorRed, showMetadata: true}
 	case op&fsnotify.Write != 0:
 		return &watchAction{label: "updated", color: colorYellow}
 	default:
