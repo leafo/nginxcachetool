@@ -46,6 +46,7 @@ func main() {
 	printFile := fs.Bool("print-file", false, "Write raw bytes of the first matched cache file to stdout")
 	summary := fs.Bool("summary", false, "Print aggregate statistics for matched entries")
 	watch := fs.Bool("watch", false, "Watch the cache directory and report file events")
+	full := fs.Bool("full", false, "Show all metadata, including headers, for each entry")
 
 	var contains stringSliceFlag
 	fs.Var(&contains, "contains", "Substring to match against cache key, path, or content-type (repeatable)")
@@ -153,7 +154,7 @@ func main() {
 		return
 	}
 
-	if err := executeList(ctx, root, *workers, filter, *jsonOut, *matchAll); err != nil {
+	if err := executeList(ctx, root, *workers, filter, *jsonOut, *matchAll, *full); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -170,11 +171,17 @@ func (s *stringSliceFlag) Set(value string) error {
 	return nil
 }
 
-func executeList(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, jsonOut bool, matchAll bool) error {
+func executeList(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, jsonOut bool, matchAll bool, full bool) error {
 	results := scanCache(ctx, root, workers)
 
-	var entries []*cacheEntry
 	var encounteredErr error
+	matched := 0
+
+	var enc *json.Encoder
+	if jsonOut {
+		enc = json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+	}
 
 	for res := range results {
 		if res.Err != nil {
@@ -190,22 +197,24 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 		if !matchAll && !filter(res.Entry) {
 			continue
 		}
-		entries = append(entries, res.Entry)
+
+		matched++
+
+		if jsonOut {
+			if err := writeJSONEntry(enc, res.Entry, root); err != nil {
+				fmt.Fprintf(os.Stderr, "encode json %s: %v\n", res.Entry.Path, err)
+				if encounteredErr == nil {
+					encounteredErr = err
+				}
+			}
+			continue
+		}
+
+		writePrettyEntry(res.Entry, root, full)
 	}
 
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Metadata.Key == entries[j].Metadata.Key {
-			return entries[i].Path < entries[j].Path
-		}
-		return entries[i].Metadata.Key < entries[j].Metadata.Key
-	})
-
-	if jsonOut {
-		if err := writeJSONList(entries, root); err != nil {
-			return err
-		}
-	} else {
-		writePrettyList(entries, root)
+	if !jsonOut {
+		fmt.Printf("Matched %d entries\n", matched)
 	}
 
 	return encounteredErr
@@ -632,49 +641,77 @@ type outputEntry struct {
 	Headers       map[string]string `json:"headers"`
 }
 
-func writeJSONList(entries []*cacheEntry, root string) error {
-	payload := make([]outputEntry, 0, len(entries))
-	for _, e := range entries {
-		rel, _ := filepath.Rel(root, e.Path)
-		payload = append(payload, outputEntry{
-			Key:           e.Metadata.Key,
-			StatusLine:    e.Metadata.StatusLine,
-			StatusCode:    e.Metadata.StatusCode,
-			Path:          e.Path,
-			RelativePath:  rel,
-			SizeBytes:     e.Size,
-			ContentLength: e.Metadata.ContentLength,
-			StoredAt:      e.ModTime,
-			Headers:       e.Metadata.Headers,
-		})
+func writeJSONEntry(enc *json.Encoder, entry *cacheEntry, root string) error {
+	rel, err := filepath.Rel(root, entry.Path)
+	if err != nil {
+		rel = entry.Path
 	}
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(payload)
+	return enc.Encode(outputEntry{
+		Key:           entry.Metadata.Key,
+		StatusLine:    entry.Metadata.StatusLine,
+		StatusCode:    entry.Metadata.StatusCode,
+		Path:          entry.Path,
+		RelativePath:  rel,
+		SizeBytes:     entry.Size,
+		ContentLength: entry.Metadata.ContentLength,
+		StoredAt:      entry.ModTime,
+		Headers:       entry.Metadata.Headers,
+	})
 }
 
-func writePrettyList(entries []*cacheEntry, root string) {
-	for _, e := range entries {
-		rel, err := filepath.Rel(root, e.Path)
-		if err != nil {
-			rel = e.Path
-		}
-		fmt.Printf("KEY: %s\n", e.Metadata.Key)
-		fmt.Printf("  Status: %s\n", e.Metadata.StatusLine)
-		fmt.Printf("  Path: %s\n", rel)
-		fmt.Printf("  Stored: %s\n", e.ModTime.Format(time.RFC3339))
-		fmt.Printf("  Size: %s", formatBytes(float64(e.Size)))
-		if e.Metadata.ContentLength > 0 {
-			fmt.Printf(" (Content-Length: %s)", formatBytes(float64(e.Metadata.ContentLength)))
-		}
-		if ct, ok := e.Metadata.Headers["content-type"]; ok {
-			fmt.Printf("\n  Content-Type: %s", ct)
-		}
-		fmt.Println()
-		fmt.Println()
+func writePrettyEntry(entry *cacheEntry, root string, full bool) {
+	rel, err := filepath.Rel(root, entry.Path)
+	if err != nil {
+		rel = entry.Path
 	}
-	fmt.Printf("Matched %d entries\n", len(entries))
+
+	fmt.Printf("KEY: %s\n", entry.Metadata.Key)
+	fmt.Printf("  Status: %s\n", entry.Metadata.StatusLine)
+	fmt.Printf("  Path: %s\n", rel)
+	fmt.Printf("  Stored: %s\n", entry.ModTime.Format(time.RFC3339))
+	fmt.Printf("  Size: %s", formatBytes(float64(entry.Size)))
+	if entry.Metadata.ContentLength > 0 {
+		fmt.Printf(" (Content-Length: %s)", formatBytes(float64(entry.Metadata.ContentLength)))
+	}
+	fmt.Println()
+
+	if !full {
+		if ct, ok := entry.Metadata.Headers["content-type"]; ok {
+			fmt.Printf("  Content-Type: %s\n", ct)
+		}
+		fmt.Println()
+		return
+	}
+
+	fmt.Printf("  Status Code: %d\n", entry.Metadata.StatusCode)
+	fmt.Printf("  Version: %d\n", entry.Metadata.Version)
+	fmt.Printf("  Header Offset: %d\n", entry.Metadata.HeaderStart)
+	fmt.Printf("  Body Offset: %d\n", entry.Metadata.BodyStart)
+	if entry.Metadata.ContentLength > 0 {
+		fmt.Printf("  Content-Length: %d bytes\n", entry.Metadata.ContentLength)
+	}
+	fmt.Printf("  Raw Header Bytes: %d\n", len(entry.Metadata.RawHeaderBlock))
+	headers := make([]string, 0, len(entry.Metadata.Headers))
+	for k := range entry.Metadata.Headers {
+		headers = append(headers, k)
+	}
+	sort.Strings(headers)
+	fmt.Println("  Headers:")
+	for _, k := range headers {
+		fmt.Printf("    %s: %s\n", k, entry.Metadata.Headers[k])
+	}
+	fmt.Println()
+	fmt.Println("  Raw Header Block:")
+	for _, line := range strings.Split(entry.Metadata.RawHeaderBlock, "\n") {
+		if line == "" {
+			fmt.Println("    ")
+			continue
+		}
+		fmt.Printf("    %s\n", line)
+	}
+	fmt.Println()
+	fmt.Println()
 }
 
 func buildEntryFilter(contains, statuses []string) (func(*cacheEntry) bool, error) {
