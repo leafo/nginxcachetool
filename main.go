@@ -46,6 +46,7 @@ func main() {
 	printFile := fs.Bool("print-file", false, "Write raw bytes of the first matched cache file to stdout")
 	summary := fs.Bool("summary", false, "Print aggregate statistics for matched entries")
 	watch := fs.Bool("watch", false, "Watch the cache directory and report file events")
+	withMetadata := fs.Bool("with-metadata", false, "In watch mode, preload and track cache metadata for change reporting")
 	full := fs.Bool("full", false, "Show all metadata, including headers, for each entry")
 	limit := fs.Int("limit", 0, "Maximum number of entries to process (0 = unlimited)")
 
@@ -121,6 +122,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--watch cannot be combined with --limit")
 		os.Exit(1)
 	}
+	if *withMetadata && !*watch {
+		fmt.Fprintln(os.Stderr, "--with-metadata requires --watch")
+		os.Exit(1)
+	}
 
 	filter, err := buildEntryFilter(contains, statusFilters, contentTypeFilters)
 	if err != nil {
@@ -131,7 +136,7 @@ func main() {
 	ctx := context.Background()
 
 	if *watch {
-		if err := executeWatch(root); err != nil {
+		if err := executeWatch(root, *withMetadata, *workers); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -375,12 +380,20 @@ func executePurge(it *entryIterator, root string, dryRun bool) error {
 	return it.Err()
 }
 
-func executeWatch(root string) error {
+func executeWatch(root string, withMetadata bool, workers int) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("create watcher: %w", err)
 	}
 	defer watcher.Close()
+
+	var store *watchMetadataStore
+	if withMetadata {
+		store = newWatchMetadataStore()
+		if err := store.Load(context.Background(), root, workers); err != nil {
+			fmt.Fprintf(os.Stderr, "initial metadata load: %v\n", err)
+		}
+	}
 
 	addDir := func(path string) error {
 		if err := watcher.Add(path); err != nil {
@@ -437,7 +450,24 @@ func executeWatch(root string) error {
 			if r, err := filepath.Rel(root, event.Name); err == nil {
 				rel = r
 			}
-			printWatchLine(action, rel, event.Name)
+
+			var cachedEntry *cacheEntry
+			if store != nil {
+				switch action.label {
+				case "added", "updated":
+					entry, err := fetchCacheEntry(event.Name)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "watch metadata %s: %v\n", event.Name, err)
+					} else {
+						store.Set(entry)
+						cachedEntry = entry
+					}
+				case "removed":
+					cachedEntry = store.Remove(event.Name)
+				}
+			}
+
+			printWatchLine(action, rel, event.Name, cachedEntry, store == nil)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -459,33 +489,37 @@ type watchAction struct {
 	showMetadata bool
 }
 
-func printWatchLine(action *watchAction, relPath, fullPath string) {
+func printWatchLine(action *watchAction, relPath, fullPath string, existing *cacheEntry, allowFetch bool) {
 	line := fmt.Sprintf("%s[%s]%s %s", action.color, action.label, colorReset, relPath)
 
-	if action.showMetadata {
-		entry, err := fetchCacheEntry(fullPath)
+	entry := existing
+	if entry == nil && allowFetch && action.showMetadata {
+		var err error
+		entry, err = fetchCacheEntry(fullPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "watch metadata %s: %v\n", fullPath, err)
-		} else {
-			ct := entry.Metadata.Headers["content-type"]
-			if ct == "" {
-				ct = "(unknown)"
-			}
-			status := entry.Metadata.StatusCode
-
-			var bodyBytes int64
-			if entry.Metadata.ContentLength > 0 {
-				bodyBytes = entry.Metadata.ContentLength
-			} else {
-				bodyBytes = entry.Size - int64(entry.Metadata.BodyStart)
-				if bodyBytes < 0 {
-					bodyBytes = entry.Size
-				}
-			}
-
-			sizeLabel := formatBytes(float64(bodyBytes))
-			line += fmt.Sprintf(" size=%s status=%d content-type=%s", sizeLabel, status, ct)
 		}
+	}
+
+	if entry != nil {
+		ct := entry.Metadata.Headers["content-type"]
+		if ct == "" {
+			ct = "(unknown)"
+		}
+		status := entry.Metadata.StatusCode
+
+		var bodyBytes int64
+		if entry.Metadata.ContentLength > 0 {
+			bodyBytes = entry.Metadata.ContentLength
+		} else {
+			bodyBytes = entry.Size - int64(entry.Metadata.BodyStart)
+			if bodyBytes < 0 {
+				bodyBytes = entry.Size
+			}
+		}
+
+		sizeLabel := formatBytes(float64(bodyBytes))
+		line += fmt.Sprintf(" size=%s status=%d content-type=%s", sizeLabel, status, ct)
 	}
 
 	fmt.Println(line)
