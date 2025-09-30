@@ -1,4 +1,4 @@
-module nginxcachetool
+module github.com/leafo/nginxcachetool
 
 go 1.22.2
 
