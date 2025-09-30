@@ -55,6 +55,9 @@ func main() {
 	var statusFilters stringSliceFlag
 	fs.Var(&statusFilters, "status", "Filter by HTTP status code (repeatable)")
 
+	var contentTypeFilters stringSliceFlag
+	fs.Var(&contentTypeFilters, "content-type", "Filter by response Content-Type header (repeatable)")
+
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if err == flag.ErrHelp {
 			return
@@ -119,7 +122,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	filter, err := buildEntryFilter(contains, statusFilters)
+	filter, err := buildEntryFilter(contains, statusFilters, contentTypeFilters)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -136,8 +139,8 @@ func main() {
 	}
 
 	if *purge {
-		if !*matchAll && len(contains) == 0 && len(statusFilters) == 0 {
-			fmt.Fprintln(os.Stderr, "refusing to purge without any filters; specify --contains, --status, or --all")
+		if !*matchAll && len(contains) == 0 && len(statusFilters) == 0 && len(contentTypeFilters) == 0 {
+			fmt.Fprintln(os.Stderr, "refusing to purge without any filters; specify --contains, --status, --content-type, or --all")
 			os.Exit(1)
 		}
 		it := newEntryIterator(ctx, root, *workers, *matchAll, *limit, filter)
@@ -228,6 +231,8 @@ func executeSummary(it *entryIterator, root string) error {
 	var totalSize int64
 	minSize := int64(-1)
 	var maxSize int64
+	var minPath string
+	var maxPath string
 	contentCounts := make(map[string]int)
 	statusCounts := make(map[int]int)
 	ageCounts := map[string]int{
@@ -245,9 +250,19 @@ func executeSummary(it *entryIterator, root string) error {
 		totalSize += size
 		if minSize == -1 || size < minSize {
 			minSize = size
+			rel := entry.Path
+			if r, err := filepath.Rel(root, entry.Path); err == nil {
+				rel = r
+			}
+			minPath = rel
 		}
 		if size > maxSize {
 			maxSize = size
+			rel := entry.Path
+			if r, err := filepath.Rel(root, entry.Path); err == nil {
+				rel = r
+			}
+			maxPath = rel
 		}
 
 		ct := entry.Metadata.Headers["content-type"]
@@ -286,8 +301,8 @@ func executeSummary(it *entryIterator, root string) error {
 	fmt.Printf("Total files: %d\n", totalFiles)
 	fmt.Printf("Total size: %s\n", formatBytes(float64(totalSize)))
 	fmt.Printf("Average size: %s\n", formatBytes(avgSize))
-	fmt.Printf("Min size: %s\n", formatBytes(float64(minSize)))
-	fmt.Printf("Max size: %s\n", formatBytes(float64(maxSize)))
+	fmt.Printf("Min size: %s (%s)\n", formatBytes(float64(minSize)), minPath)
+	fmt.Printf("Max size: %s (%s)\n", formatBytes(float64(maxSize)), maxPath)
 	fmt.Println()
 
 	fmt.Println("Content Types:")
@@ -661,7 +676,7 @@ func writePrettyEntry(entry *cacheEntry, root string, full bool) {
 	fmt.Println()
 }
 
-func buildEntryFilter(contains, statuses []string) (func(*cacheEntry) bool, error) {
+func buildEntryFilter(contains, statuses, contentTypes []string) (func(*cacheEntry) bool, error) {
 	normalized := make([]string, 0, len(contains))
 	for _, c := range contains {
 		c = strings.TrimSpace(c)
@@ -682,6 +697,15 @@ func buildEntryFilter(contains, statuses []string) (func(*cacheEntry) bool, erro
 			return nil, fmt.Errorf("invalid status code %q", s)
 		}
 		statusSet[code] = struct{}{}
+	}
+
+	contentMatchers := make([]string, 0, len(contentTypes))
+	for _, ct := range contentTypes {
+		ct = strings.TrimSpace(ct)
+		if ct == "" {
+			continue
+		}
+		contentMatchers = append(contentMatchers, strings.ToLower(ct))
 	}
 
 	return func(e *cacheEntry) bool {
@@ -708,6 +732,27 @@ func buildEntryFilter(contains, statuses []string) (func(*cacheEntry) bool, erro
 
 		if len(statusSet) > 0 {
 			if _, ok := statusSet[e.Metadata.StatusCode]; !ok {
+				return false
+			}
+		}
+
+		if len(contentMatchers) > 0 {
+			ct := strings.ToLower(e.Metadata.Headers["content-type"])
+			if ct == "" {
+				return false
+			}
+			base := ct
+			if idx := strings.Index(base, ";"); idx != -1 {
+				base = strings.TrimSpace(base[:idx])
+			}
+			matched := false
+			for _, needle := range contentMatchers {
+				if base == needle || strings.Contains(ct, needle) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
 				return false
 			}
 		}

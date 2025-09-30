@@ -59,6 +59,8 @@ Common flags:
 - `--contains <needle>` (repeatable) filters by substring on the cache entry’s
   key (`KEY:` value), full on-disk file path, or the `Content-Type` response
   header.
+- `--content-type <value>` (repeatable) keeps entries whose `Content-Type`
+  header matches (case-insensitive) or includes the provided value.
 - `--status <code>` (repeatable) filters by cached HTTP status codes.
 - `--json` streams matching entries as newline-delimited JSON.
 - `--full` prints every metadata field and header when using human-readable
@@ -140,8 +142,8 @@ Summary for /var/cache/nginx
 Total files: 661378
 Total size: 13.56 GB
 Average size: 21.50 KB
-Min size: 625 B
-Max size: 3.96 MB
+Min size: 625 B (0/00/0514439d879523f9d120d519b6cb7000)
+Max size: 3.96 MB (7/f1/aa0fdf2b6c483d0fb8ea0caaef4d8f17)
 
 Content Types:
   application/json: 105512
