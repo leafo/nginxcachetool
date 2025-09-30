@@ -184,13 +184,13 @@ func parseCacheFile(job fileJob) (*cacheEntry, error) {
 		return nil, fmt.Errorf("read header %s: %w", job.path, err)
 	}
 
-	if len(header) < bodyStartOffset+4 {
+	if len(header) < bodyStartOffset+2 {
 		return nil, errSkipCacheFile
 	}
 
 	version := header[0]
 	headerStart := int(binary.LittleEndian.Uint16(header[headerStartOffset : headerStartOffset+2]))
-	bodyStart := int(binary.LittleEndian.Uint32(header[bodyStartOffset : bodyStartOffset+4]))
+	bodyStart := int(binary.LittleEndian.Uint16(header[bodyStartOffset : bodyStartOffset+2]))
 
 	if bodyStart <= 0 || bodyStart > maxMetadataBytes {
 		return nil, fmt.Errorf("metadata size %d out of bounds in %s", bodyStart, job.path)
@@ -201,12 +201,14 @@ func parseCacheFile(job fileJob) (*cacheEntry, error) {
 	}
 
 	metadataBuf := make([]byte, bodyStart)
-	section := io.NewSectionReader(f, 0, int64(bodyStart))
-	if _, err := io.ReadFull(section, metadataBuf); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, errSkipCacheFile
+	copy(metadataBuf, header)
+	if bodyStart > len(header) {
+		if _, err := io.ReadFull(f, metadataBuf[len(header):]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, errSkipCacheFile
+			}
+			return nil, fmt.Errorf("read metadata %s: %w", job.path, err)
 		}
-		return nil, fmt.Errorf("read metadata %s: %w", job.path, err)
 	}
 
 	md, err := parseMetadata(metadataBuf, headerStart, bodyStart)
