@@ -140,7 +140,8 @@ func main() {
 			fmt.Fprintln(os.Stderr, "refusing to purge without any filters; specify --contains, --status, or --all")
 			os.Exit(1)
 		}
-		if err := executePurge(ctx, root, *workers, filter, *dryRun, *matchAll, *limit); err != nil {
+		it := newEntryIterator(ctx, root, *workers, *matchAll, *limit, filter)
+		if err := executePurge(it, root, *dryRun); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -148,7 +149,8 @@ func main() {
 	}
 
 	if *summary {
-		if err := executeSummary(ctx, root, *workers, filter, *matchAll, *limit); err != nil {
+		it := newEntryIterator(ctx, root, *workers, *matchAll, *limit, filter)
+		if err := executeSummary(it, root); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -156,14 +158,16 @@ func main() {
 	}
 
 	if *printFile {
-		if err := executePrintFile(root, *workers, filter, *matchAll, *limit); err != nil {
+		it := newEntryIterator(ctx, root, *workers, *matchAll, *limit, filter)
+		if err := executePrintFile(it); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	if err := executeList(ctx, root, *workers, filter, *jsonOut, *matchAll, *full, *limit); err != nil {
+	it := newEntryIterator(ctx, root, *workers, *matchAll, *limit, filter)
+	if err := executeList(it, root, *jsonOut, *full); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -180,18 +184,11 @@ func (s *stringSliceFlag) Set(value string) error {
 	return nil
 }
 
-func executeList(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, jsonOut bool, matchAll bool, full bool, limit int) error {
-	var cancel context.CancelFunc
-	if limit > 0 {
-		ctx, cancel = context.WithCancel(ctx)
-		defer cancel()
-	}
-
-	results := scanCache(ctx, root, workers)
+func executeList(it *entryIterator, root string, jsonOut bool, full bool) error {
+	defer it.Close()
 
 	var encounteredErr error
 	matched := 0
-	limitReached := false
 
 	var enc *json.Encoder
 	if jsonOut {
@@ -199,42 +196,18 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 		enc.SetIndent("", "  ")
 	}
 
-	for res := range results {
-		if res.Err != nil {
-			fmt.Fprintf(os.Stderr, "scan error: %v\n", res.Err)
-			if encounteredErr == nil {
-				encounteredErr = res.Err
-			}
-			continue
-		}
-		if res.Entry == nil {
-			continue
-		}
-		if limit > 0 && limitReached {
-			continue
-		}
-		if !matchAll && !filter(res.Entry) {
-			continue
-		}
-
+	for entry := range it.Entries() {
 		matched++
 
 		if jsonOut {
-			if err := writeJSONEntry(enc, res.Entry, root); err != nil {
-				fmt.Fprintf(os.Stderr, "encode json %s: %v\n", res.Entry.Path, err)
+			if err := writeJSONEntry(enc, entry, root); err != nil {
+				fmt.Fprintf(os.Stderr, "encode json %s: %v\n", entry.Path, err)
 				if encounteredErr == nil {
 					encounteredErr = err
 				}
 			}
 		} else {
-			writePrettyEntry(res.Entry, root, full)
-		}
-
-		if limit > 0 && matched >= limit {
-			limitReached = true
-			if cancel != nil {
-				cancel()
-			}
+			writePrettyEntry(entry, root, full)
 		}
 	}
 
@@ -242,19 +215,15 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 		fmt.Printf("Matched %d entries\n", matched)
 	}
 
-	return encounteredErr
+	if encounteredErr != nil {
+		return encounteredErr
+	}
+	return it.Err()
 }
 
-func executeSummary(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, matchAll bool, limit int) error {
-	var cancel context.CancelFunc
-	if limit > 0 {
-		ctx, cancel = context.WithCancel(ctx)
-		defer cancel()
-	}
+func executeSummary(it *entryIterator, root string) error {
+	defer it.Close()
 
-	results := scanCache(ctx, root, workers)
-
-	var encounteredErr error
 	var totalFiles int64
 	var totalSize int64
 	minSize := int64(-1)
@@ -268,29 +237,11 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 		"<30d":  0,
 		">=30d": 0,
 	}
-	limitReached := false
 	now := time.Now()
 
-	for res := range results {
-		if res.Err != nil {
-			fmt.Fprintf(os.Stderr, "scan error: %v\n", res.Err)
-			if encounteredErr == nil {
-				encounteredErr = res.Err
-			}
-			continue
-		}
-		if res.Entry == nil {
-			continue
-		}
-		if limit > 0 && limitReached {
-			continue
-		}
-		if !matchAll && !filter(res.Entry) {
-			continue
-		}
-
+	for entry := range it.Entries() {
 		totalFiles++
-		size := res.Entry.Size
+		size := entry.Size
 		totalSize += size
 		if minSize == -1 || size < minSize {
 			minSize = size
@@ -299,7 +250,7 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 			maxSize = size
 		}
 
-		ct := res.Entry.Metadata.Headers["content-type"]
+		ct := entry.Metadata.Headers["content-type"]
 		if ct == "" {
 			ct = "(unknown)"
 		} else {
@@ -307,9 +258,9 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 		}
 		contentCounts[ct]++
 
-		statusCounts[res.Entry.Metadata.StatusCode]++
+		statusCounts[entry.Metadata.StatusCode]++
 
-		age := now.Sub(res.Entry.ModTime)
+		age := now.Sub(entry.ModTime)
 		switch {
 		case age < time.Hour:
 			ageCounts["<1h"]++
@@ -322,18 +273,11 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 		default:
 			ageCounts[">=30d"]++
 		}
-
-		if limit > 0 && totalFiles >= int64(limit) {
-			limitReached = true
-			if cancel != nil {
-				cancel()
-			}
-		}
 	}
 
 	if totalFiles == 0 {
 		fmt.Println("No matching cache entries found.")
-		return encounteredErr
+		return it.Err()
 	}
 
 	avgSize := float64(totalSize) / float64(totalFiles)
@@ -375,73 +319,45 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 	fmt.Printf("  <30d: %d\n", ageCounts["<30d"])
 	fmt.Printf("  >=30d: %d\n", ageCounts[">=30d"])
 
-	return encounteredErr
+	return it.Err()
 }
 
-func executePurge(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, dryRun, matchAll bool, limit int) error {
-	var cancel context.CancelFunc
-	if limit > 0 {
-		ctx, cancel = context.WithCancel(ctx)
-		defer cancel()
-	}
-
-	results := scanCache(ctx, root, workers)
+func executePurge(it *entryIterator, root string, dryRun bool) error {
+	defer it.Close()
 
 	matched := 0
 	deleted := 0
-	limitReached := false
 	var encounteredErr error
 
-	for res := range results {
-		if res.Err != nil {
-			fmt.Fprintf(os.Stderr, "scan error: %v\n", res.Err)
-			if encounteredErr == nil {
-				encounteredErr = res.Err
-			}
-			continue
-		}
-		if res.Entry == nil {
-			continue
-		}
-		if limit > 0 && limitReached {
-			continue
-		}
-		if !matchAll && !filter(res.Entry) {
-			continue
-		}
-
+	for entry := range it.Entries() {
 		matched++
 
-		rel, err := filepath.Rel(root, res.Entry.Path)
+		rel, err := filepath.Rel(root, entry.Path)
 		if err != nil {
-			rel = res.Entry.Path
+			rel = entry.Path
 		}
 
 		if dryRun {
-			fmt.Printf("[dry-run] would remove %s (KEY: %s)\n", rel, res.Entry.Metadata.Key)
+			fmt.Printf("[dry-run] would remove %s (KEY: %s)\n", rel, entry.Metadata.Key)
 		} else {
-			if err := os.Remove(res.Entry.Path); err != nil {
-				fmt.Fprintf(os.Stderr, "remove %s: %v\n", res.Entry.Path, err)
+			if err := os.Remove(entry.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "remove %s: %v\n", entry.Path, err)
 				if encounteredErr == nil {
 					encounteredErr = err
 				}
 			} else {
-				fmt.Printf("Removed %s (KEY: %s)\n", rel, res.Entry.Metadata.Key)
+				fmt.Printf("Removed %s (KEY: %s)\n", rel, entry.Metadata.Key)
 				deleted++
-			}
-		}
-
-		if limit > 0 && matched >= limit {
-			limitReached = true
-			if cancel != nil {
-				cancel()
 			}
 		}
 	}
 
 	fmt.Printf("Matched %d entries, removed %d\n", matched, deleted)
 
-	return encounteredErr
+	if encounteredErr != nil {
+		return encounteredErr
+	}
+	return it.Err()
 }
 
 func executeWatch(root string) error {
@@ -606,86 +522,65 @@ func isTempCacheFile(name string) bool {
 	return true
 }
 
-func executePrintFile(root string, workers int, filter func(*cacheEntry) bool, matchAll bool, limit int) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func executePrintFile(it *entryIterator) error {
+	defer it.Close()
 
-	results := scanCache(ctx, root, workers)
-
-	var encounteredErr error
 	printed := false
-	matched := 0
 
-	for res := range results {
-		if res.Err != nil {
-			fmt.Fprintf(os.Stderr, "scan error: %v\n", res.Err)
-			if encounteredErr == nil {
-				encounteredErr = res.Err
-			}
-			continue
-		}
-		if res.Entry == nil {
-			continue
-		}
+	for entry := range it.Entries() {
 		if printed {
-			continue
-		}
-		if !matchAll && !filter(res.Entry) {
-			continue
-		}
-		if limit > 0 && matched >= limit {
-			continue
+			break
 		}
 
-		matched++
+		it.Close()
 
-		cancel()
-
-		file, err := os.Open(res.Entry.Path)
+		file, err := os.Open(entry.Path)
 		if err != nil {
-			return fmt.Errorf("open %s: %w", res.Entry.Path, err)
+			return fmt.Errorf("open %s: %w", entry.Path, err)
 		}
 
-		bodyStart := res.Entry.Metadata.BodyStart
+		bodyStart := entry.Metadata.BodyStart
 		if bodyStart <= 0 {
 			file.Close()
-			return fmt.Errorf("cache file missing body offset %s", res.Entry.Path)
+			return fmt.Errorf("cache file missing body offset %s", entry.Path)
 		}
-		if int64(bodyStart) >= res.Entry.Size {
+		if int64(bodyStart) >= entry.Size {
 			file.Close()
-			return fmt.Errorf("body offset %d beyond file size for %s", bodyStart, res.Entry.Path)
+			return fmt.Errorf("body offset %d beyond file size for %s", bodyStart, entry.Path)
 		}
 		if _, err := file.Seek(int64(bodyStart), io.SeekStart); err != nil {
 			file.Close()
-			return fmt.Errorf("seek %s: %w", res.Entry.Path, err)
+			return fmt.Errorf("seek %s: %w", entry.Path, err)
 		}
 
-		if res.Entry.Metadata.ContentLength > 0 {
-			if _, err := io.CopyN(os.Stdout, file, res.Entry.Metadata.ContentLength); err != nil {
+		if entry.Metadata.ContentLength > 0 {
+			if _, err := io.CopyN(os.Stdout, file, entry.Metadata.ContentLength); err != nil {
 				file.Close()
 				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-					return fmt.Errorf("cached body truncated for %s: %w", res.Entry.Path, err)
+					return fmt.Errorf("cached body truncated for %s: %w", entry.Path, err)
 				}
-				return fmt.Errorf("copy %s: %w", res.Entry.Path, err)
+				return fmt.Errorf("copy %s: %w", entry.Path, err)
 			}
 		} else {
 			if _, err := io.Copy(os.Stdout, file); err != nil {
 				file.Close()
-				return fmt.Errorf("copy %s: %w", res.Entry.Path, err)
+				return fmt.Errorf("copy %s: %w", entry.Path, err)
 			}
 		}
 
 		if err := file.Close(); err != nil {
-			return fmt.Errorf("close %s: %w", res.Entry.Path, err)
+			return fmt.Errorf("close %s: %w", entry.Path, err)
 		}
 		printed = true
+		break
 	}
 
 	if printed {
-		return encounteredErr
+		return it.Err()
 	}
-	if encounteredErr != nil {
-		return encounteredErr
+
+	if err := it.Err(); err != nil {
+		return err
 	}
 	return fmt.Errorf("no matching cache entries found")
 }
