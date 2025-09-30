@@ -47,6 +47,7 @@ func main() {
 	summary := fs.Bool("summary", false, "Print aggregate statistics for matched entries")
 	watch := fs.Bool("watch", false, "Watch the cache directory and report file events")
 	full := fs.Bool("full", false, "Show all metadata, including headers, for each entry")
+	limit := fs.Int("limit", 0, "Maximum number of entries to process (0 = unlimited)")
 
 	var contains stringSliceFlag
 	fs.Var(&contains, "contains", "Substring to match against cache key, path, or content-type (repeatable)")
@@ -109,6 +110,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--watch cannot be combined with --json")
 		os.Exit(1)
 	}
+	if *limit < 0 {
+		fmt.Fprintln(os.Stderr, "--limit cannot be negative")
+		os.Exit(1)
+	}
+	if *watch && *limit > 0 {
+		fmt.Fprintln(os.Stderr, "--watch cannot be combined with --limit")
+		os.Exit(1)
+	}
 
 	filter, err := buildEntryFilter(contains, statusFilters)
 	if err != nil {
@@ -118,18 +127,6 @@ func main() {
 
 	ctx := context.Background()
 
-	if *purge {
-		if !*matchAll && len(contains) == 0 && len(statusFilters) == 0 {
-			fmt.Fprintln(os.Stderr, "refusing to purge without any filters; specify --contains, --status, or --all")
-			os.Exit(1)
-		}
-		if err := executePurge(ctx, root, *workers, filter, *dryRun, *matchAll); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	if *watch {
 		if err := executeWatch(root); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -138,8 +135,20 @@ func main() {
 		return
 	}
 
+	if *purge {
+		if !*matchAll && len(contains) == 0 && len(statusFilters) == 0 {
+			fmt.Fprintln(os.Stderr, "refusing to purge without any filters; specify --contains, --status, or --all")
+			os.Exit(1)
+		}
+		if err := executePurge(ctx, root, *workers, filter, *dryRun, *matchAll, *limit); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *summary {
-		if err := executeSummary(ctx, root, *workers, filter, *matchAll); err != nil {
+		if err := executeSummary(ctx, root, *workers, filter, *matchAll, *limit); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -147,14 +156,14 @@ func main() {
 	}
 
 	if *printFile {
-		if err := executePrintFile(root, *workers, filter, *matchAll); err != nil {
+		if err := executePrintFile(root, *workers, filter, *matchAll, *limit); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	if err := executeList(ctx, root, *workers, filter, *jsonOut, *matchAll, *full); err != nil {
+	if err := executeList(ctx, root, *workers, filter, *jsonOut, *matchAll, *full, *limit); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -171,11 +180,18 @@ func (s *stringSliceFlag) Set(value string) error {
 	return nil
 }
 
-func executeList(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, jsonOut bool, matchAll bool, full bool) error {
+func executeList(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, jsonOut bool, matchAll bool, full bool, limit int) error {
+	var cancel context.CancelFunc
+	if limit > 0 {
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+	}
+
 	results := scanCache(ctx, root, workers)
 
 	var encounteredErr error
 	matched := 0
+	limitReached := false
 
 	var enc *json.Encoder
 	if jsonOut {
@@ -194,6 +210,9 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 		if res.Entry == nil {
 			continue
 		}
+		if limit > 0 && limitReached {
+			continue
+		}
 		if !matchAll && !filter(res.Entry) {
 			continue
 		}
@@ -207,10 +226,16 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 					encounteredErr = err
 				}
 			}
-			continue
+		} else {
+			writePrettyEntry(res.Entry, root, full)
 		}
 
-		writePrettyEntry(res.Entry, root, full)
+		if limit > 0 && matched >= limit {
+			limitReached = true
+			if cancel != nil {
+				cancel()
+			}
+		}
 	}
 
 	if !jsonOut {
@@ -220,7 +245,13 @@ func executeList(ctx context.Context, root string, workers int, filter func(*cac
 	return encounteredErr
 }
 
-func executeSummary(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, matchAll bool) error {
+func executeSummary(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, matchAll bool, limit int) error {
+	var cancel context.CancelFunc
+	if limit > 0 {
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+	}
+
 	results := scanCache(ctx, root, workers)
 
 	var encounteredErr error
@@ -237,6 +268,7 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 		"<30d":  0,
 		">=30d": 0,
 	}
+	limitReached := false
 	now := time.Now()
 
 	for res := range results {
@@ -248,6 +280,9 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 			continue
 		}
 		if res.Entry == nil {
+			continue
+		}
+		if limit > 0 && limitReached {
 			continue
 		}
 		if !matchAll && !filter(res.Entry) {
@@ -286,6 +321,13 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 			ageCounts["<30d"]++
 		default:
 			ageCounts[">=30d"]++
+		}
+
+		if limit > 0 && totalFiles >= int64(limit) {
+			limitReached = true
+			if cancel != nil {
+				cancel()
+			}
 		}
 	}
 
@@ -336,11 +378,18 @@ func executeSummary(ctx context.Context, root string, workers int, filter func(*
 	return encounteredErr
 }
 
-func executePurge(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, dryRun, matchAll bool) error {
+func executePurge(ctx context.Context, root string, workers int, filter func(*cacheEntry) bool, dryRun, matchAll bool, limit int) error {
+	var cancel context.CancelFunc
+	if limit > 0 {
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+	}
+
 	results := scanCache(ctx, root, workers)
 
 	matched := 0
 	deleted := 0
+	limitReached := false
 	var encounteredErr error
 
 	for res := range results {
@@ -352,6 +401,9 @@ func executePurge(ctx context.Context, root string, workers int, filter func(*ca
 			continue
 		}
 		if res.Entry == nil {
+			continue
+		}
+		if limit > 0 && limitReached {
 			continue
 		}
 		if !matchAll && !filter(res.Entry) {
@@ -367,19 +419,24 @@ func executePurge(ctx context.Context, root string, workers int, filter func(*ca
 
 		if dryRun {
 			fmt.Printf("[dry-run] would remove %s (KEY: %s)\n", rel, res.Entry.Metadata.Key)
-			continue
-		}
-
-		if err := os.Remove(res.Entry.Path); err != nil {
-			fmt.Fprintf(os.Stderr, "remove %s: %v\n", res.Entry.Path, err)
-			if encounteredErr == nil {
-				encounteredErr = err
+		} else {
+			if err := os.Remove(res.Entry.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "remove %s: %v\n", res.Entry.Path, err)
+				if encounteredErr == nil {
+					encounteredErr = err
+				}
+			} else {
+				fmt.Printf("Removed %s (KEY: %s)\n", rel, res.Entry.Metadata.Key)
+				deleted++
 			}
-			continue
 		}
 
-		fmt.Printf("Removed %s (KEY: %s)\n", rel, res.Entry.Metadata.Key)
-		deleted++
+		if limit > 0 && matched >= limit {
+			limitReached = true
+			if cancel != nil {
+				cancel()
+			}
+		}
 	}
 
 	fmt.Printf("Matched %d entries, removed %d\n", matched, deleted)
@@ -549,7 +606,7 @@ func isTempCacheFile(name string) bool {
 	return true
 }
 
-func executePrintFile(root string, workers int, filter func(*cacheEntry) bool, matchAll bool) error {
+func executePrintFile(root string, workers int, filter func(*cacheEntry) bool, matchAll bool, limit int) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -557,6 +614,7 @@ func executePrintFile(root string, workers int, filter func(*cacheEntry) bool, m
 
 	var encounteredErr error
 	printed := false
+	matched := 0
 
 	for res := range results {
 		if res.Err != nil {
@@ -575,6 +633,11 @@ func executePrintFile(root string, workers int, filter func(*cacheEntry) bool, m
 		if !matchAll && !filter(res.Entry) {
 			continue
 		}
+		if limit > 0 && matched >= limit {
+			continue
+		}
+
+		matched++
 
 		cancel()
 
@@ -692,16 +755,6 @@ func writePrettyEntry(entry *cacheEntry, root string, full bool) {
 		fmt.Printf("  Content-Length: %d bytes\n", entry.Metadata.ContentLength)
 	}
 	fmt.Printf("  Raw Header Bytes: %d\n", len(entry.Metadata.RawHeaderBlock))
-	headers := make([]string, 0, len(entry.Metadata.Headers))
-	for k := range entry.Metadata.Headers {
-		headers = append(headers, k)
-	}
-	sort.Strings(headers)
-	fmt.Println("  Headers:")
-	for _, k := range headers {
-		fmt.Printf("    %s: %s\n", k, entry.Metadata.Headers[k])
-	}
-	fmt.Println()
 	fmt.Println("  Raw Header Block:")
 	for _, line := range strings.Split(entry.Metadata.RawHeaderBlock, "\n") {
 		if line == "" {
@@ -710,7 +763,6 @@ func writePrettyEntry(entry *cacheEntry, root string, full bool) {
 		}
 		fmt.Printf("    %s\n", line)
 	}
-	fmt.Println()
 	fmt.Println()
 }
 
