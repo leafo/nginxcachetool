@@ -7,12 +7,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func main() {
@@ -31,6 +36,7 @@ func main() {
 	matchAll := fs.Bool("all", false, "Match every cache entry (dangerous)")
 	printFile := fs.Bool("print-file", false, "Write raw bytes of the first matched cache file to stdout")
 	summary := fs.Bool("summary", false, "Print aggregate statistics for matched entries")
+	watch := fs.Bool("watch", false, "Watch the cache directory and report file events")
 
 	var contains stringSliceFlag
 	fs.Var(&contains, "contains", "Substring to match against cache key, path, or content-type (repeatable)")
@@ -77,6 +83,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "--summary cannot be combined with --json")
 		os.Exit(1)
 	}
+	if *watch && *purge {
+		fmt.Fprintln(os.Stderr, "--watch cannot be combined with --purge")
+		os.Exit(1)
+	}
+	if *watch && *printFile {
+		fmt.Fprintln(os.Stderr, "--watch cannot be combined with --print-file")
+		os.Exit(1)
+	}
+	if *watch && *summary {
+		fmt.Fprintln(os.Stderr, "--watch cannot be combined with --summary")
+		os.Exit(1)
+	}
+	if *watch && *jsonOut {
+		fmt.Fprintln(os.Stderr, "--watch cannot be combined with --json")
+		os.Exit(1)
+	}
 
 	filter, err := buildEntryFilter(contains, statusFilters)
 	if err != nil {
@@ -92,6 +114,14 @@ func main() {
 			os.Exit(1)
 		}
 		if err := executePurge(ctx, root, *workers, filter, *dryRun, *matchAll); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *watch {
+		if err := executeWatch(root); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -337,6 +367,120 @@ func executePurge(ctx context.Context, root string, workers int, filter func(*ca
 	fmt.Printf("Matched %d entries, removed %d\n", matched, deleted)
 
 	return encounteredErr
+}
+
+func executeWatch(root string) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("create watcher: %w", err)
+	}
+	defer watcher.Close()
+
+	addDir := func(path string) error {
+		if err := watcher.Add(path); err != nil {
+			return fmt.Errorf("watch %s: %w", path, err)
+		}
+		return nil
+	}
+
+	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if err := addDir(path); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("walk directories: %w", err)
+	}
+
+	fmt.Printf("Watching %s (press Ctrl+C to stop)\n", root)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			if event.Name == "" {
+				continue
+			}
+
+			if event.Op&fsnotify.Create != 0 {
+				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+					if err := addDir(event.Name); err != nil {
+						fmt.Fprintf(os.Stderr, "watch add %s: %v\n", event.Name, err)
+					}
+					continue
+				}
+			}
+
+			action := classifyCacheEvent(event.Op, event.Name)
+			if action == "" {
+				continue
+			}
+
+			rel := event.Name
+			if r, err := filepath.Rel(root, event.Name); err == nil {
+				rel = r
+			}
+			fmt.Printf("[%s] %s\n", action, rel)
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "watch error: %v\n", err)
+			}
+		case <-sigCh:
+			fmt.Println("Stopping watch.")
+			return nil
+		}
+	}
+}
+
+func classifyCacheEvent(op fsnotify.Op, name string) string {
+	if isTempCacheFile(name) {
+		return ""
+	}
+	switch {
+	case op&fsnotify.Create != 0:
+		return "added"
+	case op&fsnotify.Remove != 0:
+		return "removed"
+	case op&fsnotify.Rename != 0:
+		return "removed"
+	case op&fsnotify.Write != 0:
+		return "updated"
+	default:
+		return ""
+	}
+}
+
+func isTempCacheFile(name string) bool {
+	base := filepath.Base(name)
+	dot := strings.LastIndex(base, ".")
+	if dot == -1 {
+		return false
+	}
+	suffix := base[dot+1:]
+	if len(suffix) != 10 {
+		return false
+	}
+	for _, ch := range suffix {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func executePrintFile(root string, workers int, filter func(*cacheEntry) bool, matchAll bool) error {
