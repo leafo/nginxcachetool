@@ -35,7 +35,7 @@ server {
 Install it into your Go bin directory (usually `~/go/bin`) with:
 
 ```sh
-go install github.com/leafo/nginxcachetool
+go install github.com/leafo/nginxcachetool@latest
 ```
 
 ## Building
@@ -139,22 +139,22 @@ Sample output:
 
 ```
 Summary for /var/cache/nginx
-Total files: 661378
+Total files: 661,378
 Total size: 13.56 GB
 Average size: 21.50 KB
 Min size: 625 B (0/00/0514439d879523f9d120d519b6cb7000)
 Max size: 3.96 MB (7/f1/aa0fdf2b6c483d0fb8ea0caaef4d8f17)
 
 Content Types:
-  application/json: 105512
+  application/json: 105,512
   application/rss+xml: 13
   application/xml: 316
-  text/html: 555537
+  text/html: 555,537
 
 Status Codes:
-  200: 550662
-  301: 2178
-  302: 108351
+  200: 550,662
+  301: 2,178
+  302: 108,351
   404: 55
   451: 132
 ```

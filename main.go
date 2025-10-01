@@ -220,7 +220,7 @@ func executeList(it *entryIterator, root string, jsonOut bool, full bool) error 
 	}
 
 	if !jsonOut {
-		fmt.Printf("Matched %d entries\n", matched)
+		fmt.Printf("Matched %s entries\n", formatInt(int64(matched)))
 	}
 
 	if encounteredErr != nil {
@@ -303,7 +303,7 @@ func executeSummary(it *entryIterator, root string) error {
 	avgSize := float64(totalSize) / float64(totalFiles)
 
 	fmt.Printf("Summary for %s\n", root)
-	fmt.Printf("Total files: %d\n", totalFiles)
+	fmt.Printf("Total files: %s\n", formatInt(int64(totalFiles)))
 	fmt.Printf("Total size: %s\n", formatBytes(float64(totalSize)))
 	fmt.Printf("Average size: %s\n", formatBytes(avgSize))
 	fmt.Printf("Min size: %s (%s)\n", formatBytes(float64(minSize)), minPath)
@@ -317,7 +317,7 @@ func executeSummary(it *entryIterator, root string) error {
 	}
 	sort.Strings(contentKeys)
 	for _, k := range contentKeys {
-		fmt.Printf("  %s: %d\n", k, contentCounts[k])
+		fmt.Printf("  %s: %s\n", k, formatInt(int64(contentCounts[k])))
 	}
 
 	fmt.Println()
@@ -328,16 +328,16 @@ func executeSummary(it *entryIterator, root string) error {
 	}
 	sort.Ints(statusKeys)
 	for _, k := range statusKeys {
-		fmt.Printf("  %d: %d\n", k, statusCounts[k])
+		fmt.Printf("  %d: %s\n", k, formatInt(int64(statusCounts[k])))
 	}
 
 	fmt.Println()
 	fmt.Println("Age Distribution:")
-	fmt.Printf("  <1h: %d\n", ageCounts["<1h"])
-	fmt.Printf("  <1d: %d\n", ageCounts["<1d"])
-	fmt.Printf("  <7d: %d\n", ageCounts["<7d"])
-	fmt.Printf("  <30d: %d\n", ageCounts["<30d"])
-	fmt.Printf("  >=30d: %d\n", ageCounts[">=30d"])
+	fmt.Printf("  <1h: %s\n", formatInt(int64(ageCounts["<1h"])))
+	fmt.Printf("  <1d: %s\n", formatInt(int64(ageCounts["<1d"])))
+	fmt.Printf("  <7d: %s\n", formatInt(int64(ageCounts["<7d"])))
+	fmt.Printf("  <30d: %s\n", formatInt(int64(ageCounts["<30d"])))
+	fmt.Printf("  >=30d: %s\n", formatInt(int64(ageCounts[">=30d"])))
 
 	return it.Err()
 }
@@ -372,7 +372,7 @@ func executePurge(it *entryIterator, root string, dryRun bool) error {
 		}
 	}
 
-	fmt.Printf("Matched %d entries, removed %d\n", matched, deleted)
+	fmt.Printf("Matched %s entries, removed %s\n", formatInt(int64(matched)), formatInt(int64(deleted)))
 
 	if encounteredErr != nil {
 		return encounteredErr
@@ -394,7 +394,7 @@ func executeWatch(root string, withMetadata bool, workers int) error {
 		if err := store.Load(context.Background(), root, workers); err != nil {
 			fmt.Fprintf(os.Stderr, "initial metadata load: %v\n", err)
 		}
-		fmt.Printf("Loaded metadata for %d cache entries.\n", store.Count())
+		fmt.Printf("Loaded metadata for %s cache entries.\n", formatInt(int64(store.Count())))
 	}
 
 	addDir := func(path string) error {
@@ -537,6 +537,21 @@ func printWatchLine(action *watchAction, relPath, fullPath string, existing *cac
 	}
 
 	fmt.Println(line)
+}
+
+func formatInt(n int64) string {
+	sign := ""
+	if n < 0 {
+		sign = "-"
+		n = -n
+	}
+
+	s := strconv.FormatInt(n, 10)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+
+	return sign + s
 }
 
 func fetchCacheEntry(path string) (*cacheEntry, error) {
