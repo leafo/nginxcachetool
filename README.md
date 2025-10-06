@@ -13,10 +13,10 @@ followed by an ASCII block that embeds the original response headers and the
 cached body. This program will recursively scan a directory for these cache
 files and only read the metadata from each file to understand what it contains.
 
-Enable proxy caching in NGINX with `proxy_cache_path` and `proxy_cache`:
-
 <details>
-<summary>Enable proxy caching in NGINX with `proxy_cache_path` and `proxy_cache`:</summary>
+<summary>
+Enable proxy caching in NGINX with `proxy_cache_path` and `proxy_cache`:
+</summary>
 
 ```nginx
 proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=my_cache:10m inactive=60m;
