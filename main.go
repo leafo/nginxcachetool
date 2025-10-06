@@ -347,10 +347,13 @@ func executePurge(it *entryIterator, root string, dryRun bool) error {
 
 	matched := 0
 	deleted := 0
+	var matchedSize int64
+	var deletedSize int64
 	var encounteredErr error
 
 	for entry := range it.Entries() {
 		matched++
+		matchedSize += entry.Size
 
 		rel, err := filepath.Rel(root, entry.Path)
 		if err != nil {
@@ -368,11 +371,16 @@ func executePurge(it *entryIterator, root string, dryRun bool) error {
 			} else {
 				fmt.Printf("Removed %s (KEY: %s)\n", rel, entry.Metadata.Key)
 				deleted++
+				deletedSize += entry.Size
 			}
 		}
 	}
 
-	fmt.Printf("Matched %s entries, removed %s\n", formatInt(int64(matched)), formatInt(int64(deleted)))
+	if dryRun {
+		fmt.Printf("Matched %s entries (total size %s). Dry run: no files removed.\n", formatInt(int64(matched)), formatBytes(float64(matchedSize)))
+	} else {
+		fmt.Printf("Matched %s entries, removed %s (%s total deleted)\n", formatInt(int64(matched)), formatInt(int64(deleted)), formatBytes(float64(deletedSize)))
+	}
 
 	if encounteredErr != nil {
 		return encounteredErr
