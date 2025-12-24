@@ -20,9 +20,14 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const (
-	version = "1.0.0"
+const version = "1.0.0"
 
+var (
+	commit    = "dev"
+	buildTime = "unknown"
+)
+
+const (
 	colorReset  = "\x1b[0m"
 	colorGreen  = "\x1b[32m"
 	colorYellow = "\x1b[33m"
@@ -72,6 +77,8 @@ func main() {
 
 	if *showVersion {
 		fmt.Printf("nginxcachetool %s\n", version)
+		fmt.Printf("  commit: %s\n", commit)
+		fmt.Printf("  built:  %s\n", buildTime)
 		return
 	}
 
