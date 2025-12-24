@@ -21,6 +21,8 @@ import (
 )
 
 const (
+	version = "1.0.0"
+
 	colorReset  = "\x1b[0m"
 	colorGreen  = "\x1b[32m"
 	colorYellow = "\x1b[33m"
@@ -38,6 +40,7 @@ func main() {
 		fs.PrintDefaults()
 	}
 
+	showVersion := fs.Bool("version", false, "Print version and exit")
 	workers := fs.Int("workers", 0, "Number of concurrent workers (default: number of CPUs)")
 	jsonOut := fs.Bool("json", false, "Emit JSON instead of human-readable output")
 	purge := fs.Bool("purge", false, "Delete matched cache entries")
@@ -65,6 +68,11 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
+	}
+
+	if *showVersion {
+		fmt.Printf("nginxcachetool %s\n", version)
+		return
 	}
 
 	args := fs.Args()
